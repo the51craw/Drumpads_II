@@ -1,0 +1,33 @@
+Main:
+--- Drum Pad ---
+* Help    # Menu 
+
+Help:
+* Exit/prevous
+# Enter/next
+
+Numbers 0-9 or
+A = up, B = down
+
+Pad 0 = bd-pedal
+Pad 1 = snare
+
+Pad 2 = highhat
+3-10 = cym board
+
+11-13 tom board
+MIDI I/O ch 0-15
+
+Menu:
+1 Sound  2 Patch
+3 MIDI channel
+
+Drum pad nn */#
+Sound nnn 0-127
+
+Patch nn (0-18)
+D=Load C=Save   -> Save to patch nn
+                   Sure? *=No #=Yes
+
+MIDI out ch: nn
+ MIDI in ch: nn

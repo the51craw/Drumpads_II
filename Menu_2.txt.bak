@@ -1,0 +1,12 @@
+A-Patch  B-Sound
+C-Chan.  D-Setup
+
+Patch 0-?
+*Menu
+
+Pad 0-16  nn
+*Menu     #Enter
+
+Sound nnn C+ D-
+*Menu     #Enter
+

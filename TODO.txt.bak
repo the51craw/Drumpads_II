@@ -1,0 +1,18 @@
+Höja klockfrekvensen.
+	Defines för olika frekvenser.
+	Kompensera enligt defines.
+
+Detektera pads som inte är inkopplade.
+
+Bygga lådan.
+	Göra anslutningar.
+		Ingångar.
+		Ström.
+
+Koppla tangentbord och display.
+
+Skriva displaydrivare.
+
+Skriva tangentbordsdrivare.
+
+Skriva menyn.

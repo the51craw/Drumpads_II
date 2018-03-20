@@ -1,0 +1,376 @@
+#include "main.h"
+#include "DrumPad_drv.h"
+
+unsigned char ADC_channel_select = 0; // Start at channel 0;
+unsigned char Overhearing_protection = 0; // Count down from OVER_HEARING_TIMEOUT to 0 while blocking SOFT_BEAT hits
+
+#pragma udata Buffer
+unsigned char Buffer[128];  // Stores up to 128 bytes = 32 MIDI events
+unsigned char StorePos = 0; // Position to store next 4 event bytes, wraps around
+unsigned char ReadPos  = 0; // Position to read, no data to fetch if same as StorePos
+
+unsigned char LastPeak[13];
+unsigned char TopValue[13];
+unsigned char TimeStamp[13];
+unsigned char State[13];
+
+void DrumPad_drv_check_ad(void);
+void DrumPad_drv_StartConversion(void);
+unsigned char IsOverhearing(void);
+
+#define USED_AD_CHANNELS (unsigned int)13 
+
+////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////
+// Exported funktions
+////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////////
+// DrumPad_Setup
+////////////////////////////////////////////////////////////////
+
+void DrumPad_Setup(void)
+{
+	unsigned char i;
+
+	// Set AD control registers:
+	TRISA = 0xBF;	// Set all as input except RA6. All are analog except RA4 that is HH-pedal input, and RA6 that is output only.
+	TRISB = 0xFF;	// Set RB0-4 as inputs (AN12, 10, 8, 9, 11) RB4-7 are used as flashing pins
+	TRISE = 0xFF;	// Set RE0-2 as inputs (AN5 - AN7)
+
+	// We should always have a conversion going on. Then we know that CONVERSION_DONE is valid.
+	DrumPad_drv_StartConversion();
+}
+
+void DrumPad_IncrementTimers(void)
+{
+	unsigned char i;
+
+	for(i = 0; i < USED_AD_CHANNELS; i++)
+	{
+		TimeStamp[i]++;
+	}
+	if(Overhearing_protection > (unsigned int)0)
+	{
+		Overhearing_protection--;
+	}
+}
+	
+////////////////////////////////////////////////////////////////
+// DrumPad_Get
+// Returns 0xFF if a new event is filled out in event
+// Returns 0x00 if not, but first checks A/D conversions
+////////////////////////////////////////////////////////////////
+
+unsigned char DrumPad_Get(MIDI_EVENT * event)
+{
+	DrumPad_drv_check_ad();
+
+	// If we have data in in-buffer, get it:
+	if(ReadPos != StorePos)
+	{
+		event->Event    = Buffer[ReadPos++];
+		ReadPos &= 0x7F;
+		event->Channel  = Buffer[ReadPos++];
+		ReadPos &= 0x7F;
+		event->Note     = Buffer[ReadPos++];
+		ReadPos &= 0x7F;
+		event->Velocity = Buffer[ReadPos++];
+		ReadPos &= 0x7F;
+		return 0xFF;
+	}
+
+	return 0x00;
+}
+
+// States
+#define IDLE (unsigned char)0                 		// This is before level starts rising.
+#define DETECTING_HIT (unsigned char)1        		// This is while detecting highest valid peak.
+#define WAIT_WHILE_BOUNCHING (unsigned char)2 		// This is for not registering oscilations in microphone membrane.
+#define RAMPING_DOWN (unsigned char)3         		// This is while ramping down and accepting new hits compared to last hit.
+#define CLAMPING_DOWN (unsigned char)4        		// This is for using I/O as output to force to zero.
+#define STAY_DEAD_WHILE_BOUNCHING (unsigned char)5
+
+void DrumPad_Reset(void)
+{
+	unsigned char i;
+
+	for(i = 0; i < USED_AD_CHANNELS; i++)
+	{
+		TopValue[i] = 0;			// Reset top value list
+		TimeStamp[i] = 0;			// Reset timestamps:
+		State[i] = IDLE;			// Reset states:
+		LastPeak[i] = 0;
+	}
+
+	// Reset buffer positions and channel #:
+	StorePos = 0;
+	ReadPos  = 0;
+	ADC_channel_select = 0;
+}	
+
+////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////
+// Internals
+////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////
+
+/*
+REGISTER 21-3: ADCON2: A/D CONTROL REGISTER 2
+ADFM (ZERO) ACQT2 ACQT1 ACQT0 ADCS2 ADCS1 ADCS0
+ADFM = 1 for right adjuted result.
+ACQ0-2 = Aquisition time. 0, 2, 4, 6, 8, 12, 16, 20 Tad
+ADCS0-2 = Conversion clock. 000 = F0sc/2, 001 = Fosc/4 etc 110 = Fosc/64 
+*/
+
+void DrumPad_drv_StartConversion(void)
+{
+	ADCON1 = 0x02;                          // No VRef:s, use all channels
+	ADCON0 = (ADC_channel_select << 0x02);  // Set channel select bits
+
+	// Left justify (0xxx xxxx)
+	// Acquisition Time = 4 (xx01 0xxx)
+	// Clock Select = FOSC/16 (xxxx x101) = 1,25 MHz -> Tad = 0.8 us
+	// AD conversion time = (succ. approx 10 bits = max 4 steps)
+	ADCON2 = 0x95;
+
+	ADCON0 |= 0x01;                         // Enable A/D
+	START_CONVERSION;                       // Start conversion
+}
+
+void store(unsigned char in)
+{
+	// Event:
+	if(in > (unsigned int)0)
+	{
+		Buffer[StorePos++] = 0x80;
+	}
+	else
+	{
+		Buffer[StorePos++] = 0x90;
+	}
+	StorePos &= 0x7F;
+	// Channel:
+	Buffer[StorePos++] = 0x09;
+	StorePos &= 0x7F;
+	// Key (pad, actually):
+	Buffer[StorePos++] = ADC_channel_select; 
+	StorePos &= 0x7F;
+	// Velocity:
+	Buffer[StorePos++] = in;
+	StorePos &= 0x7F;
+}
+
+void next(void)
+{
+	ADC_channel_select++;
+	if(ADC_channel_select >= USED_AD_CHANNELS)
+	{
+		ADC_channel_select = 0;
+	}
+}
+
+/*
+// States
+#define IDLE 0                 // This is before level starts rising.
+#define DETECTING_HIT 1        // This is while detecting highest valid peak.
+#define WAIT_WHILE_BOUNCHING 2 // This is for not registering oscilations in microphone membrane.
+#define RAMPING_DOWN 3       // This is while ramping down and accepting new hits compared to last hit.
+*/
+
+// Over-hearing protection
+//#define HARD_BEAT (unsigned int)60					// A beat hard enough to cause over-hearing
+//#define SOFT_BEAT (unsigned int)50					// A soft beat that could be over-hearing
+#define OVERHEARING_TIMEOUT (unsigned int)10		// Time to block out over-hearing fake beats
+#define OVERHEARING_DIFFERENCE (unsigned int)5		// Difference between current peak (under) and any other 
+													// channel's current peak while in overhearing timeout
+													// must be no more than this value in order to count 
+													// as a hit rather than overhearing.
+#define OVERHEARING_EARLY (unsigned int)1			// Time another hit causes an overhearing might be BEFORE the detected hit
+#define OVERHEARING_LATE (unsigned int)2            // Time another hit causes an overhearing might be AFTER the detected hit
+
+// Times and levels
+// A hit has like 5 - 10 peaks during 10 - 20 ms + more lower and lower peaks following (debounce).
+// The highest of the initial peaks marks the velocity of the hit, detected during detection time.
+#define THRESHOLD (unsigned int)4            // Lowest A/D to start detecting a hit
+#define NEW_HIT_DIFFERENCE (unsigned int)0   // Lowest difference between last debounce peak and a new peak to detect
+#define DETECTION_TIME (unsigned int)10      // Time to detect initial peaks
+#define DEBOUNCE_TIME (unsigned int)10       // Time we do not accept new hits whatever.
+#define RAMPING_DOWN_TIME (unsigned int)200  // Listening for new peaks that are not more than DRUM_ROLL_DIFF under last hit.
+											 //This time repeats until last peak is under THRESHOLD.
+#define DRUM_ROLL_DIFF (unsigned char)5
+void SetOverhearingProtection(void)
+{
+	Overhearing_protection = OVERHEARING_TIMEOUT;
+}
+
+void DrumPad_drv_check_ad(void)
+{
+//	static unsigned char hard_beat = (unsigned char)0;
+	unsigned char temp;
+	if(CONVERSION_DONE)
+	{
+		if(ADRESH > (unsigned int)0)
+			temp = 255;
+		else
+			temp = ADRESL;
+
+		switch(State[ADC_channel_select])
+		{
+			// Stay in idle while input is not above the threshold.
+			case IDLE:
+				if(temp > THRESHOLD) // Input noise elimination
+				{
+					// Ramping up...
+					TimeStamp[ADC_channel_select] = 0;
+					TopValue[ADC_channel_select] = temp;
+					State[ADC_channel_select] = DETECTING_HIT;
+				}	
+			break;
+			// Ramp up until value below top, and at least for DETECTION_TIME ms.
+			case DETECTING_HIT:
+				if(temp > TopValue[ADC_channel_select])
+				{
+					// Still ramping up...
+					TopValue[ADC_channel_select] = temp;
+				}
+				else if(TimeStamp[ADC_channel_select] > DETECTION_TIME)
+				{
+//					if(Overhearing_protection == (unsigned int)0 || TopValue[ADC_channel_select] > SOFT_BEAT)
+					if(!IsOverhearing())
+					{
+						// We have a hit!
+						store(0);
+						store(TopValue[ADC_channel_select] / 2);
+
+						// Prepare for ramping down while detecting new hit:
+						LastPeak[ADC_channel_select] = TopValue[ADC_channel_select];
+						State[ADC_channel_select] = WAIT_WHILE_BOUNCHING;
+					}	
+
+						// Set over-hearing counter if this was a hard hit:
+						//if(temp > HARD_BEAT)
+//						{
+//							Overhearing_protection = OVER_HEARING_TIMEOUT;
+//						}
+//					}
+					else
+					{
+						// This was just over-hearing
+						State[ADC_channel_select] = RAMPING_DOWN;
+
+						// Prepare for ramping down while NOT detecting new hits:
+						TimeStamp[ADC_channel_select] = 0;
+						LastPeak[ADC_channel_select] = 0; // Not to confuse other channels.
+						State[ADC_channel_select] = STAY_DEAD_WHILE_BOUNCHING;
+					}
+//					TopValue[ADC_channel_select] = 0;
+//					TimeStamp[ADC_channel_select] = 0;
+				}
+			break;
+			// WAIT_WHILE_BOUNCHING is when pad is bouncing, and no hits are to be recognized.
+			case WAIT_WHILE_BOUNCHING:
+				if(TimeStamp[ADC_channel_select] > DEBOUNCE_TIME)
+				{
+					State[ADC_channel_select] = RAMPING_DOWN;
+				}
+				break;
+			// Just wait and detect new hits.
+			case RAMPING_DOWN:
+				// Stay in ramping down while peaks are less than DRUM_ROLL_DIFF under last hit:
+				// Here we might be ramping upto a top.
+				if(temp > TopValue[ADC_channel_select])
+				{
+					TopValue[ADC_channel_select] = temp;
+				}
+				// So, ramping down from a top.
+				// Was it larger than last one, with a bit margin, this indicates a new hit.
+				if (TopValue[ADC_channel_select] > LastPeak[ADC_channel_select] - DRUM_ROLL_DIFF)
+				{
+					TimeStamp[ADC_channel_select] = 0;
+					State[ADC_channel_select] = DETECTING_HIT;
+				}
+
+				// Time for next ramp:
+				if(TimeStamp[ADC_channel_select] > RAMPING_DOWN_TIME)
+				{
+					if(TopValue[ADC_channel_select] > THRESHOLD)
+					{
+						TimeStamp[ADC_channel_select] = 0;
+						TopValue[ADC_channel_select] = THRESHOLD;
+					}
+					else
+					{
+						// Ramp is down:
+						State[ADC_channel_select] = IDLE;
+					}		
+				}
+			break;
+			case STAY_DEAD_WHILE_BOUNCHING:
+				if (temp > THRESHOLD)
+				{
+					TimeStamp[ADC_channel_select] = 0;
+				}
+				else if (TimeStamp[ADC_channel_select] > OVERHEARING_TIMEOUT)
+				{
+					State[ADC_channel_select] = IDLE;
+				}	
+			break;
+			case CLAMPING_DOWN:
+			break;
+		}	
+
+		// Move to next channel:
+		next();
+		DrumPad_drv_StartConversion();
+	}
+}
+
+unsigned char IsOverhearing(void)
+{
+	// We try to decide whether this is an overhearing or not
+	// by examining the states, timing and top-level of the
+	// other drumpads.
+	// If another sound has started within one or two milliseconds
+	// before, or maybe even one after (yes, since first part of wave
+	// is negative, the overhearing might actually be detected 
+	// before the original sound is detected) and is lower (or maybe
+	// even almost the same) volume, it is most probably overhearing.
+	// Filtering like this will unfortunately also remove one of two
+	// simultaneous hits, so keep limits well trimmed.
+	unsigned char i;
+	return 0x00;
+
+	for (i = 0; i < USED_AD_CHANNELS; i++)
+	{
+		if (i != ADC_channel_select)
+		{
+			// Check for one millisecond left in state DETECTING_HIT
+			// or max two milliseconds into WAIT_WHILE_BOUNCHING,
+			// which we just entered:
+			if
+			(
+				(
+					(
+						(State[i] == DETECTING_HIT)
+						&&
+						(TimeStamp[i] < (DETECTION_TIME - OVERHEARING_LATE))
+					)
+					||
+					(
+						(State[i] == WAIT_WHILE_BOUNCHING)
+						&&
+						(TimeStamp[i] > OVERHEARING_EARLY)
+					)
+				)
+				&&
+				TopValue[i] >= (TopValue[ADC_channel_select] + OVERHEARING_DIFFERENCE)
+			)
+			{
+				return 0xff;
+			}
+		}
+	}
+	return 0x00;
+}
